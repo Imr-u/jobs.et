@@ -1,0 +1,55 @@
+name: Scrape Afriworket Jobs
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # Every day at 06:00 UTC
+  workflow_dispatch:        # Manual trigger from GitHub UI
+
+permissions:
+  contents: write           # Needed to push jobs.parquet back to repo
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Dependencies ──────────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Playwright browsers ───────────────────────────────────────────────
+      - name: Install Playwright + Chromium
+        run: playwright install --with-deps chromium
+
+      # ── 5. Run scraper ───────────────────────────────────────────────────────
+      - name: Run scraper
+        run: python scraper.py
+
+      # ── 6. Upload parquet as artifact (always, even if push fails) ───────────
+      - name: Upload jobs.parquet as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: afriworket-jobs-${{ github.run_number }}
+          path: data/jobs.parquet
+          retention-days: 30
+
+      # ── 7. Commit & push updated parquet ────────────────────────────────────
+      - name: Commit and push results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/jobs.parquet
+          git diff --cached --quiet && echo "No changes to commit" || \
+            git commit -m "chore: update jobs data [$(date -u '+%Y-%m-%d %H:%M UTC')]" && \
+            git push
