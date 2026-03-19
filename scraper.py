@@ -1,10 +1,11 @@
 """
 Afriworket Job Scraper
 ======================
-- Scrapes up to 100 job listings from afriworket.com/jobs
-- Visits each job detail page for full data
-- Deduplicates on (title, company, deadline)
-- Saves results to data/jobs.parquet
+- Scrapes up to 100 job listings from afriworket.com/jobs per run
+- Appends to existing parquet then deduplicates on (title, company, deadline)
+- All missing fields are None — never empty string
+- Numeric fields use pandas Int64 (nullable)
+- Null % audit printed after every run
 """
 
 import re
@@ -16,10 +17,12 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE_URL    = "https://afriworket.com"
 JOBS_URL    = f"{BASE_URL}/jobs"
-MAX_JOBS    = 100
+MAX_JOBS    = 30
 OUTPUT_DIR  = Path("data")
 OUTPUT_FILE = OUTPUT_DIR / "jobs.parquet"
 MONTHS      = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+
+NAV_TEXTS = {"view details", "load more", "login", "register", "back"}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -48,11 +51,6 @@ def to_int_or_none(value):
 # ── detail page parser ─────────────────────────────────────────────────────────
 
 def parse_detail_page(page, url, retries=3):
-    """
-    Load a job detail page and extract all fields.
-    Retries up to `retries` times on timeout or missing content.
-    All missing fields are None — never empty string.
-    """
     empty = {
         "title":                   None,
         "company":                 None,
@@ -81,58 +79,41 @@ def parse_detail_page(page, url, retries=3):
 
     for attempt in range(1, retries + 1):
         try:
-            # Use networkidle so JS-rendered content is present before we read
             page.goto(url, wait_until="networkidle", timeout=45_000)
-
-            # Extra wait for dynamic content to settle
             page.wait_for_timeout(2000)
 
-            # Confirm the page actually rendered a job (h1 must exist)
             try:
                 page.wait_for_selector("h1", timeout=10_000)
             except PWTimeout:
-                print(f"  [attempt {attempt}/{retries}] No h1 yet on {url} — retrying ...")
+                print(f"  [attempt {attempt}/{retries}] No h1 yet — retrying ...")
                 time.sleep(2 * attempt)
                 continue
 
             h1 = page.query_selector("h1")
             h1_text = clean_or_none(h1.inner_text()) if h1 else None
             if not h1_text:
-                print(f"  [attempt {attempt}/{retries}] h1 is empty on {url} — retrying ...")
+                print(f"  [attempt {attempt}/{retries}] h1 empty — retrying ...")
                 time.sleep(2 * attempt)
                 continue
 
-            # ── page loaded OK — extract everything ──────────────────────
-            extra = dict(empty)  # start from blank slate
+            extra = dict(empty)
             extra["title"] = h1_text
 
-            # Industry — first h2
             h2s = page.query_selector_all("h2")
             if h2s:
                 extra["industry"] = clean_or_none(h2s[0].inner_text())
 
-            # Full visible body text (preserves newlines for block detection)
             raw_body = page.inner_text("body") or ""
 
-            # ── posted date ──────────────────────────────────────────────
             extra["posted_date"] = parse_or_none(
-                rf"Posted\s+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})",
-                raw_body
+                rf"Posted\s+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", raw_body
             )
-
-            # ── deadline ─────────────────────────────────────────────────
             extra["deadline"] = parse_or_none(
-                rf"Deadline[:\s]+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})",
-                raw_body
+                rf"Deadline[:\s]+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", raw_body
             )
-
-            # ── location ─────────────────────────────────────────────────
             extra["location"] = parse_or_none(
-                r"([A-Za-z ]+,\s*Ethiopia|Addis Ababa(?:,\s*Ethiopia)?)",
-                raw_body
+                r"([A-Za-z ]+,\s*Ethiopia|Addis Ababa(?:,\s*Ethiopia)?)", raw_body
             )
-
-            # ── job type ─────────────────────────────────────────────────
             extra["job_type"] = parse_or_none(
                 r"Job Type[:\s]*((?:Onsite|Remote|Hybrid)\s*[-–]\s*(?:Full Time|Part Time|Contract|Freelance))",
                 raw_body
@@ -143,16 +124,13 @@ def parse_detail_page(page, url, retries=3):
                     raw_body
                 )
 
-            # ── structured key-value fields ──────────────────────────────
             def kv(label):
-                # Try same-line first: "Vacancies:  2"
                 same = parse_or_none(
                     rf"^{re.escape(label)}\s*[:\-]?\s*(.+)",
                     raw_body, flags=re.IGNORECASE | re.MULTILINE
                 )
                 if same:
                     return same
-                # Try next-line: label alone, value on next line
                 m = re.search(
                     rf"^{re.escape(label)}\s*$\s*^(.+)",
                     raw_body, flags=re.IGNORECASE | re.MULTILINE
@@ -165,7 +143,6 @@ def parse_detail_page(page, url, retries=3):
             extra["work_address"]             = kv("Work Address")
             extra["vacancies"]                = to_int_or_none(extra["vacancies_raw"])
 
-            # ── salary ───────────────────────────────────────────────────
             sal_m = re.search(r"([\d,]+)\s*ETB(?:\s+(\w+))?", raw_body, re.IGNORECASE)
             if sal_m:
                 extra["salary_raw"]    = clean_or_none(sal_m.group(0))
@@ -173,14 +150,12 @@ def parse_detail_page(page, url, retries=3):
                 period = clean_or_none(sal_m.group(2))
                 extra["salary_period"] = period if period and len(period) < 20 else None
 
-            # ── experience level ─────────────────────────────────────────
             exp_m = re.search(
                 r"\b(Expert|Senior|Intermediate|Junior|Entry[- ]?Level)\b",
                 raw_body, re.IGNORECASE
             )
             extra["experience_level"] = clean_or_none(exp_m.group(1)) if exp_m else None
 
-            # ── skills ───────────────────────────────────────────────────
             skills_m = re.search(
                 r"Skills And Expertise\s*\n([\s\S]+?)(?:\nWork Address|\nJob Description|\ncompany\b)",
                 raw_body, re.IGNORECASE
@@ -193,7 +168,6 @@ def parse_detail_page(page, url, retries=3):
                 )
                 extra["skills"] = ", ".join(tokens) if tokens else clean_or_none(raw_skills)
 
-            # ── full description ──────────────────────────────────────────
             desc_m = re.search(
                 r"Job Description\s*\n([\s\S]+?)(?:\nSkills And Expertise|\n+Jobs Posted:|\Z)",
                 raw_body, re.IGNORECASE
@@ -202,13 +176,9 @@ def parse_detail_page(page, url, retries=3):
                 desc = clean_or_none(desc_m.group(1))
                 extra["full_description"] = desc if desc and len(desc) >= 30 else None
 
-            # ── company name ──────────────────────────────────────────────
-            # Method 1: text just before "Jobs Posted: N"
             co_m = re.search(r"([^\n]{3,80})\s*\nJobs Posted:\s*\d+", raw_body, re.IGNORECASE)
             if co_m:
                 extra["company"] = clean_or_none(co_m.group(1))
-
-            # Method 2: fallback — sibling element after h1
             if not extra["company"]:
                 sib = page.query_selector("h1 + p, h1 + div, h1 ~ p")
                 if sib:
@@ -216,7 +186,6 @@ def parse_detail_page(page, url, retries=3):
                     if candidate and len(candidate) < 80:
                         extra["company"] = candidate
 
-            # ── company profile URL & jobs posted ─────────────────────────
             company_link = page.query_selector("a[href*='/company/']")
             if company_link:
                 href = company_link.get_attribute("href") or ""
@@ -236,7 +205,7 @@ def parse_detail_page(page, url, retries=3):
             print(f"  [attempt {attempt}/{retries}] Timeout on {url}")
             time.sleep(3 * attempt)
         except Exception as exc:
-            print(f"  [attempt {attempt}/{retries}] Error on {url}: {exc}")
+            print(f"  [attempt {attempt}/{retries}] Error: {exc}")
             time.sleep(2 * attempt)
 
     print(f"  FAILED after {retries} attempts: {url}")
@@ -247,8 +216,7 @@ def parse_detail_page(page, url, retries=3):
 
 def scrape():
     OUTPUT_DIR.mkdir(exist_ok=True)
-    all_jobs = []
-    seen     = set()
+    scraped = []   # raw results from this run only
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -258,11 +226,9 @@ def scrape():
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/123.0.0.0 Safari/537.36"
             ),
-            # Disable images and fonts to speed up page loads
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
 
-        # Block images, fonts, media — we only need HTML/JS
         def block_resources(route):
             if route.request.resource_type in ("image", "media", "font"):
                 route.abort()
@@ -271,7 +237,6 @@ def scrape():
 
         list_page   = context.new_page()
         detail_page = context.new_page()
-
         list_page.route("**/*", block_resources)
         detail_page.route("**/*", block_resources)
 
@@ -279,17 +244,17 @@ def scrape():
         list_page.goto(JOBS_URL, wait_until="networkidle", timeout=60_000)
         list_page.wait_for_timeout(2000)
 
-        while len(all_jobs) < MAX_JOBS:
+        while len(scraped) < MAX_JOBS:
             anchors = list_page.query_selector_all("a[href^='/jobs/']")
             job_anchors = [
                 a for a in anchors
                 if re.search(r"/jobs/[0-9a-f-]{36}$", a.get_attribute("href") or "")
+                and (a.inner_text() or "").strip().lower() not in NAV_TEXTS
             ]
-            print(f"  Found {len(job_anchors)} job links visible ...")
+            print(f"  Found {len(job_anchors)} valid job title links ...")
 
             for anchor in job_anchors:
-                if len(all_jobs) >= MAX_JOBS:
-                    print(f"Reached {MAX_JOBS}-job limit.")
+                if len(scraped) >= MAX_JOBS:
                     break
 
                 href       = anchor.get_attribute("href") or ""
@@ -312,7 +277,6 @@ def scrape():
                     if re.search(r"Onsite|Remote|Hybrid|Posted\s+\d", text, re.IGNORECASE):
                         break
 
-                # Card-level fallback fields
                 company = None
                 for line in [l.strip() for l in card_text.splitlines() if l.strip()]:
                     if line == title:
@@ -334,19 +298,11 @@ def scrape():
                 job_type        = parse_or_none(r"((?:Onsite|Remote|Hybrid)\s*[-–]\s*(?:Full Time|Part Time|Contract|Freelance))", card_text)
                 exp_level       = parse_or_none(r"\b(Expert|Senior|Intermediate|Junior|Entry[- ]?Level)\b", card_text)
 
-                # Dedup
-                key = ((title or "").lower(), (company or "").lower(), (deadline or "").lower())
-                if key in seen:
-                    print(f"  Duplicate skipped: {title or '(no title)'}")
-                    continue
-                seen.add(key)
+                print(f"  [{len(scraped)+1}/{MAX_JOBS}] {(title or '(no title)')[:55]} ...")
 
-                print(f"  [{len(all_jobs)+1}/{MAX_JOBS}] {(title or '(no title)')[:55]} ...")
-
-                # Detail page is authoritative — card fields are fallback only
                 detail = parse_detail_page(detail_page, detail_url)
 
-                job = {
+                scraped.append({
                     "title":                   detail["title"] or title,
                     "company":                 detail["company"] or company,
                     "location":                detail["location"] or location,
@@ -370,20 +326,17 @@ def scrape():
                     "detail_url":              detail_url,
                     "detail_parse_ok":         detail["detail_parse_ok"],
                     "scraped_at":              datetime.utcnow().isoformat(),
-                }
-                all_jobs.append(job)
-
-                # Polite delay between detail page requests (1-2s)
+                })
                 time.sleep(1.2)
 
-            if len(all_jobs) >= MAX_JOBS:
+            if len(scraped) >= MAX_JOBS:
                 break
 
             load_more = list_page.query_selector(
                 "button:has-text('Load More'), a:has-text('Load More')"
             )
             if not load_more:
-                print("  No 'Load More' button — all listings exhausted.")
+                print("  No 'Load More' button — listing page exhausted.")
                 break
             print("  Clicking 'Load More' ...")
             load_more.scroll_into_view_if_needed()
@@ -392,36 +345,51 @@ def scrape():
 
         browser.close()
 
-    # ── build DataFrame ────────────────────────────────────────────────────────
-    df = pd.DataFrame(all_jobs)
+    print(f"\nScraped {len(scraped)} jobs this run.")
 
+    # ── load existing + concat + dedup + save ──────────────────────────────────
+    new_df = pd.DataFrame(scraped)
+
+    if OUTPUT_FILE.exists():
+        existing_df = pd.read_parquet(OUTPUT_FILE, engine="pyarrow")
+        print(f"Existing records: {len(existing_df)}")
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        print("No existing parquet — creating fresh.")
+        combined_df = new_df
+
+    # Cast nullable integers
     for col in ("salary", "vacancies", "company_jobs_posted"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+        if col in combined_df.columns:
+            combined_df[col] = pd.to_numeric(combined_df[col], errors="coerce").astype("Int64")
 
-    before = len(df)
-    df = df.drop_duplicates(subset=["title", "company", "deadline"])
-    dropped = before - len(df)
-    if dropped:
-        print(f"  Final dedup removed {dropped} row(s).")
+    # Dedup across full combined dataset — keep first occurrence (older entry wins)
+    before = len(combined_df)
+    combined_df = combined_df.drop_duplicates(subset=["title", "company", "deadline"], keep="first")
+    dupes_dropped = before - len(combined_df)
+    new_net = len(combined_df) - (len(existing_df) if OUTPUT_FILE.exists() else 0)
 
-    # scraped_at always last
-    cols = [c for c in df.columns if c != "scraped_at"] + ["scraped_at"]
-    df = df[cols]
+    print(f"Duplicates dropped: {dupes_dropped}")
+    print(f"Net new records added: {new_net}")
+    print(f"Total records in storage: {len(combined_df)}")
 
-    # Null audit
-    print("\nNull % per column:")
-    null_pct = (df.isna().sum() / len(df) * 100).round(1)
+    # scraped_at always last column
+    cols = [c for c in combined_df.columns if c != "scraped_at"] + ["scraped_at"]
+    combined_df = combined_df[cols]
+
+    # ── null audit on this run's new rows only ─────────────────────────────────
+    print(f"\nNull % per column (this run, {len(new_df)} rows):")
+    null_pct = (new_df.isna().sum() / len(new_df) * 100).round(1)
     for col, pct in null_pct.items():
         flag = "  <-- HIGH" if pct > 50 else ""
         print(f"  {col:<30} {pct:>5}%{flag}")
 
-    failed = df[~df["detail_parse_ok"]].shape[0]
+    failed = new_df[~new_df["detail_parse_ok"]].shape[0]
     if failed:
-        print(f"\n  WARNING: {failed} rows had detail_parse_ok=False (detail page failed)")
+        print(f"\n  WARNING: {failed} rows had detail_parse_ok=False")
 
-    df.to_parquet(OUTPUT_FILE, index=False, engine="pyarrow")
-    print(f"\nSaved {len(df)} jobs to {OUTPUT_FILE}")
+    combined_df.to_parquet(OUTPUT_FILE, index=False, engine="pyarrow")
+    print(f"\nSaved → {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
