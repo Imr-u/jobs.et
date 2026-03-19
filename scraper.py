@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE_URL    = "https://afriworket.com"
 JOBS_URL    = f"{BASE_URL}/jobs"
-MAX_JOBS    = 30
+MAX_JOBS    = 100
 OUTPUT_DIR  = Path("data")
 OUTPUT_FILE = OUTPUT_DIR / "jobs.parquet"
 MONTHS      = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
@@ -106,10 +106,10 @@ def parse_detail_page(page, url, retries=3):
             raw_body = page.inner_text("body") or ""
 
             extra["posted_date"] = parse_or_none(
-                rf"Posted\s+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", raw_body
+                rf"Posted\s+((?:{MONTHS})[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", raw_body
             )
             extra["deadline"] = parse_or_none(
-                rf"Deadline[:\s]+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", raw_body
+                rf"Deadline[:\s]+((?:{MONTHS})[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", raw_body
             )
             extra["location"] = parse_or_none(
                 r"([A-Za-z ]+,\s*Ethiopia|Addis Ababa(?:,\s*Ethiopia)?)", raw_body
@@ -176,7 +176,7 @@ def parse_detail_page(page, url, retries=3):
                 desc = clean_or_none(desc_m.group(1))
                 extra["full_description"] = desc if desc and len(desc) >= 30 else None
 
-            co_m = re.search(r"([^\n]{3,80})\s*\nJobs Posted:\s*\d+", raw_body, re.IGNORECASE)
+            co_m = re.search(r"([^\n]{3,80})\s*\ncompany\s*\nJobs Posted:\s*\d+", raw_body, re.IGNORECASE)
             if co_m:
                 extra["company"] = clean_or_none(co_m.group(1))
             if not extra["company"]:
@@ -294,7 +294,7 @@ def scrape():
 
                 location        = parse_or_none(r"([A-Za-z ]+,\s*Ethiopia|Addis Ababa(?:,\s*Ethiopia)?)", card_text)
                 posted_relative = parse_or_none(r"Posted\s+(.+?)(?:\n|$)", card_text)
-                deadline        = parse_or_none(rf"({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", card_text)
+                deadline        = parse_or_none(rf"((?:{MONTHS})[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", card_text)
                 job_type        = parse_or_none(r"((?:Onsite|Remote|Hybrid)\s*[-–]\s*(?:Full Time|Part Time|Contract|Freelance))", card_text)
                 exp_level       = parse_or_none(r"\b(Expert|Senior|Intermediate|Junior|Entry[- ]?Level)\b", card_text)
 
