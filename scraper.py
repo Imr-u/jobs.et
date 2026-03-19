@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE_URL    = "https://afriworket.com"
 JOBS_URL    = f"{BASE_URL}/jobs"
-MAX_JOBS    = 100
+MAX_JOBS    = 30
 OUTPUT_DIR  = Path("data")
 OUTPUT_FILE = OUTPUT_DIR / "jobs.parquet"
 MONTHS      = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
