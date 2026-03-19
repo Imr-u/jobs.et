@@ -522,5 +522,9 @@ def scrape():
     df.to_parquet(OUTPUT_FILE, index=False, engine="pyarrow")
     print(f"\nSaved {len(df)} jobs to {OUTPUT_FILE}")
 
+    jsonl_file = OUTPUT_DIR / "jobs.jsonl"
+    df.to_json(jsonl_file, orient="records", lines=True, force_ascii=False)
+    print(f"Saved {len(df)} jobs to {jsonl_file}")
+
 if __name__ == "__main__":
     scrape()
