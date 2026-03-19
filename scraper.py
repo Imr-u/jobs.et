@@ -6,16 +6,20 @@ Afriworket Job Scraper
 - Deduplicates on (title, company, deadline)
 - Saves results to data/jobs.parquet
 
-Null / empty value strategy
-----------------------------
-- All optional text fields use None (pd.NA in DataFrame) — never ""
-- Numeric fields (salary, vacancies, company_jobs_posted) are cast to
-  pandas Int64 (nullable integer) so NaN doesn't force float dtype
-- parse_or_none() wraps every regex so a no-match returns None, not ""
-- clean_or_none() returns None for blank/whitespace-only strings
-- Page-load failures set detail_parse_ok=False so downstream users can
-  filter out rows where detail extraction may be incomplete
-- A final audit after building the DataFrame logs null % per column
+CSS selectors confirmed from browser DevTools:
+  List page card:
+    title    : <a href="/jobs/UUID"> inner text
+    company  : span.font-medium.text-gray-500 (inside card container)
+    location : span.text-stone-500 (inside card container)
+    deadline : span:has-text("Deadline:") -> sibling p.whitespace-nowrap
+    job_type : text matching Onsite/Remote/Hybrid - Full/Part Time
+
+  Detail page:
+    title    : h1
+    company  : span.flex.items-center.gap-1.text-sm.font-medium.text-gray-500
+    location : span.text-sm.font-normal.text-stone-500
+    industry : first h2
+    deadline : JS eval — span[text='Deadline:'] -> parent div -> next p
 """
 
 import re
@@ -25,9 +29,9 @@ from pathlib import Path
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-BASE_URL  = "https://afriworket.com"
-JOBS_URL  = f"{BASE_URL}/jobs"
-MAX_JOBS  = 100
+BASE_URL    = "https://afriworket.com"
+JOBS_URL    = f"{BASE_URL}/jobs"
+MAX_JOBS    = 30
 OUTPUT_DIR  = Path("data")
 OUTPUT_FILE = OUTPUT_DIR / "jobs.parquet"
 
@@ -37,13 +41,23 @@ MONTHS = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def clean_or_none(text):
+    """Normalise whitespace. Returns None for blank strings."""
     if text is None:
         return None
     normalised = re.sub(r"\s+", " ", text).strip()
     return normalised if normalised else None
 
 
+def el_text(el, selector):
+    """Query selector within an element, return inner text or None."""
+    child = el.query_selector(selector)
+    return clean_or_none(child.inner_text()) if child else None
+
+
 def parse_or_none(pattern, text, group=1, flags=re.IGNORECASE):
+    """Regex match returning named group or None."""
+    if not text:
+        return None
     m = re.search(pattern, text, flags)
     if not m:
         return None
@@ -51,16 +65,153 @@ def parse_or_none(pattern, text, group=1, flags=re.IGNORECASE):
 
 
 def to_int_or_none(value):
+    """Strip non-digits and parse to int, or None."""
     if value is None:
         return None
     digits = re.sub(r"[^\d]", "", str(value))
     return int(digits) if digits else None
 
 
+def extract_company_from_span(el, selector):
+    """
+    Get company name from a span that contains both text and an SVG icon.
+    SVG aria-hidden icons contribute empty/garbage to inner_text() —
+    we use JS to read only direct text nodes.
+    """
+    result = el.evaluate(f"""(root) => {{
+        const span = root.querySelector('{selector}');
+        if (!span) return null;
+        // Collect only direct text node content (skip SVG children)
+        let text = '';
+        for (const node of span.childNodes) {{
+            if (node.nodeType === Node.TEXT_NODE) {{
+                text += node.textContent;
+            }}
+        }}
+        return text.trim() || null;
+    }}""")
+    return clean_or_none(result)
+
+
+def extract_deadline_from_card(card_el):
+    """
+    Find deadline in a card element using JS DOM traversal.
+    Structure: <span>Deadline:</span> -> parent -> sibling <p class="whitespace-nowrap ...">
+    """
+    result = card_el.evaluate("""(root) => {
+        // Find the Deadline label span
+        const spans = Array.from(root.querySelectorAll('span'));
+        const label = spans.find(s => s.textContent.trim() === 'Deadline:');
+        if (!label) return null;
+
+        // The value <p> is a sibling of the label's parent div
+        const labelParent = label.parentElement;
+        if (!labelParent) return null;
+
+        // Try next sibling first
+        let sib = labelParent.nextElementSibling;
+        while (sib) {
+            const p = sib.querySelector ? sib.querySelector('p.whitespace-nowrap, p') : null;
+            if (p && p.textContent.trim()) return p.textContent.trim();
+            if (sib.tagName === 'P' && sib.textContent.trim()) return sib.textContent.trim();
+            sib = sib.nextElementSibling;
+        }
+
+        // Try parent's parent sibling
+        const grandParent = labelParent.parentElement;
+        if (grandParent) {
+            const next = grandParent.nextElementSibling;
+            if (next) {
+                const p = next.querySelector('p.whitespace-nowrap, p');
+                if (p) return p.textContent.trim();
+            }
+        }
+        return null;
+    }""")
+    return clean_or_none(result)
+
+
+# ── card parser (listing page) ─────────────────────────────────────────────────
+
+def parse_card(anchor):
+    """
+    Extract all available fields from a job card on the listing page.
+    The anchor <a> is the title link. All other fields are in parent/sibling elements.
+    We walk up to the card root element and query by CSS class.
+    """
+    title = clean_or_none(anchor.inner_text())
+    href  = anchor.get_attribute("href") or ""
+
+    # Walk up to find card container — stop when we find the element
+    # that contains company + location + deadline info
+    card_el = anchor
+    for _ in range(6):
+        parent = card_el.evaluate_handle("el => el.parentElement")
+        if not parent:
+            break
+        parent_el = parent.as_element()
+        if not parent_el:
+            break
+        # Check if this level has company span or deadline span
+        has_company  = parent_el.query_selector("span.font-medium, span.text-gray-500")
+        has_deadline = parent_el.query_selector("span")
+        if has_company or has_deadline:
+            text_check = parent_el.inner_text() or ""
+            if re.search(r"Deadline|Onsite|Remote|Hybrid|Posted", text_check, re.IGNORECASE):
+                card_el = parent_el
+                break
+        card_el = parent_el
+
+    card_text = card_el.inner_text() or ""
+
+    # Company — span with font-medium text-gray-500 classes (contains SVG icon + company name)
+    # Use JS text-node extraction to avoid SVG pollution
+    company = extract_company_from_span(
+        card_el,
+        "span.font-medium.text-gray-500, span.text-sm.font-medium.text-gray-500"
+    )
+
+    # Location — span with text-stone-500
+    location = el_text(card_el, "span.text-stone-500, span.text-sm.text-stone-500")
+
+    # Deadline — DOM traversal via JS
+    deadline = extract_deadline_from_card(card_el)
+    # Fallback: regex on card text
+    if not deadline:
+        deadline = parse_or_none(
+            rf"({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", card_text
+        )
+
+    # Posted relative time
+    posted_relative = parse_or_none(r"Posted\s+(.+?)(?:\n|$)", card_text)
+
+    # Job type
+    job_type = parse_or_none(
+        r"((?:Onsite|Remote|Hybrid)\s*[-–]\s*(?:Full Time|Part Time|Contract|Freelance))",
+        card_text
+    )
+
+    # Experience level
+    exp_level = parse_or_none(
+        r"\b(Expert|Senior|Intermediate|Junior|Entry[- ]?Level)\b", card_text
+    )
+
+    return {
+        "title":           title,
+        "company":         company,
+        "location":        location,
+        "deadline":        deadline,
+        "posted_relative": posted_relative,
+        "job_type":        job_type,
+        "exp_level":       exp_level,
+        "detail_url":      BASE_URL + href if href.startswith("/") else href,
+    }
+
+
 # ── detail page parser ─────────────────────────────────────────────────────────
 
 def parse_detail_page(page, url):
-    extra = {
+    result = {
         "title":                   None,
         "company":                 None,
         "location":                None,
@@ -82,7 +233,6 @@ def parse_detail_page(page, url):
         "company_profile_url":     None,
         "company_jobs_posted_raw": None,
         "company_jobs_posted":     None,
-        "detail_url":              url,
         "detail_parse_ok":         False,
     }
 
@@ -93,91 +243,117 @@ def parse_detail_page(page, url):
         h1 = page.query_selector("h1")
         if not h1:
             print(f"  WARNING: No h1 on {url}")
-            return extra
+            return result
 
-        extra["title"] = clean_or_none(h1.inner_text())
+        # title
+        result["title"] = clean_or_none(h1.inner_text())
 
-        # Company name — typically a plain text node right after h1
-        # Try querying a sibling or nearby element before falling back to body text
-        company_el = page.query_selector("h1 + p, h1 + div, h1 ~ p")
-        if company_el:
-            candidate = clean_or_none(company_el.inner_text())
-            # Reject if it looks like an industry/category label (has & or multiple words in title case)
-            if candidate and len(candidate) < 80 and not re.search(r"&|Engineering|Technology|Finance|Administration|Production|Entertainment|Education|Logistics|Service|Accounting|Manufacturing|Multimedia|Supply", candidate, re.IGNORECASE):
-                extra["company"] = candidate
+        # company — span with exact Tailwind classes seen in DevTools
+        # Use JS text-node extraction to avoid SVG aria-label pollution
+        result["company"] = extract_company_from_span(
+            page,
+            "span.flex.items-center.gap-1.text-sm.font-medium.text-gray-500"
+        )
 
-        # Industry — first h2
+        # location
+        result["location"] = el_text(page, "span.text-sm.font-normal.text-stone-500")
+
+        # industry — first h2
         h2s = page.query_selector_all("h2")
         if h2s:
-            extra["industry"] = clean_or_none(h2s[0].inner_text())
+            result["industry"] = clean_or_none(h2s[0].inner_text())
+
+        # deadline — JS DOM traversal (same structure as card)
+        result["deadline"] = page.evaluate("""() => {
+            const spans = Array.from(document.querySelectorAll('span'));
+            const label = spans.find(s => s.textContent.trim() === 'Deadline:');
+            if (!label) return null;
+            const labelParent = label.parentElement;
+            if (!labelParent) return null;
+            // Sibling <p> with the date
+            let sib = labelParent.nextElementSibling;
+            while (sib) {
+                if (sib.tagName === 'P' && sib.textContent.trim()) {
+                    return sib.textContent.trim();
+                }
+                const p = sib.querySelector && sib.querySelector('p.whitespace-nowrap, p');
+                if (p && p.textContent.trim()) return p.textContent.trim();
+                sib = sib.nextElementSibling;
+            }
+            // Grandparent sibling
+            const gp = labelParent.parentElement;
+            if (gp) {
+                const next = gp.nextElementSibling;
+                if (next) {
+                    const p = next.querySelector('p.whitespace-nowrap, p');
+                    if (p) return p.textContent.trim();
+                }
+            }
+            return null;
+        }""")
+        result["deadline"] = clean_or_none(result["deadline"])
 
         raw_body = page.inner_text("body") or ""
 
-        # ── posted date ──────────────────────────────────────────────────────
-        extra["posted_date"] = parse_or_none(
+        # Fallback deadline from body text
+        if not result["deadline"]:
+            result["deadline"] = parse_or_none(
+                rf"Deadline[:\s]+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})",
+                raw_body
+            )
+
+        # posted date
+        result["posted_date"] = parse_or_none(
             rf"Posted\s+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})",
             raw_body
         )
 
-        # ── deadline ─────────────────────────────────────────────────────────
-        extra["deadline"] = parse_or_none(
-            rf"Deadline[:\s]+({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})",
-            raw_body
-        )
-
-        # ── location ─────────────────────────────────────────────────────────
-        extra["location"] = parse_or_none(
-            r"([A-Za-z ]+,\s*Ethiopia|Addis Ababa(?:,\s*Ethiopia)?)",
-            raw_body
-        )
-
-        # ── job type ─────────────────────────────────────────────────────────
-        extra["job_type"] = parse_or_none(
+        # job type
+        result["job_type"] = parse_or_none(
             r"Job Type[:\s]*((?:Onsite|Remote|Hybrid)\s*[-–]\s*(?:Full Time|Part Time|Contract|Freelance))",
             raw_body
         )
-        # Fallback without "Job Type:" label
-        if not extra["job_type"]:
-            extra["job_type"] = parse_or_none(
+        if not result["job_type"]:
+            result["job_type"] = parse_or_none(
                 r"((?:Onsite|Remote|Hybrid)\s*[-–]\s*(?:Full Time|Part Time|Contract|Freelance))",
                 raw_body
             )
 
-        # ── key-value fields ─────────────────────────────────────────────────
+        # key-value fields
         def kv(label):
-            same = parse_or_none(
+            v = parse_or_none(
                 rf"^{re.escape(label)}\s*[:\-]?\s*(.+)",
                 raw_body, flags=re.IGNORECASE | re.MULTILINE
             )
-            if same:
-                return same
+            if v:
+                return v
             m = re.search(
                 rf"^{re.escape(label)}\s*$\s*^(.+)",
                 raw_body, flags=re.IGNORECASE | re.MULTILINE
             )
             return clean_or_none(m.group(1)) if m else None
 
-        extra["vacancies_raw"]            = kv("Vacancies")
-        extra["education_qualification"]  = kv("Education Qualification")
-        extra["applicants_needed"]        = kv("Applicants Needed")
-        extra["work_address"]             = kv("Work Address")
+        result["vacancies_raw"]            = kv("Vacancies")
+        result["education_qualification"]  = kv("Education Qualification")
+        result["applicants_needed"]        = kv("Applicants Needed")
+        result["work_address"]             = kv("Work Address")
 
-        # ── salary ───────────────────────────────────────────────────────────
+        # salary
         sal_m = re.search(r"([\d,]+)\s*ETB(?:\s+(\w+))?", raw_body, re.IGNORECASE)
         if sal_m:
-            extra["salary_raw"]    = clean_or_none(sal_m.group(0))
-            extra["salary"]        = to_int_or_none(sal_m.group(1))
+            result["salary_raw"]    = clean_or_none(sal_m.group(0))
+            result["salary"]        = to_int_or_none(sal_m.group(1))
             period = clean_or_none(sal_m.group(2))
-            extra["salary_period"] = period if period and len(period) < 20 else None
+            result["salary_period"] = period if period and len(period) < 20 else None
 
-        # ── experience level ─────────────────────────────────────────────────
+        # experience level
         exp_m = re.search(
             r"\b(Expert|Senior|Intermediate|Junior|Entry[- ]?Level)\b",
             raw_body, re.IGNORECASE
         )
-        extra["experience_level"] = clean_or_none(exp_m.group(1)) if exp_m else None
+        result["experience_level"] = clean_or_none(exp_m.group(1)) if exp_m else None
 
-        # ── skills ───────────────────────────────────────────────────────────
+        # skills
         skills_m = re.search(
             r"Skills And Expertise\s*\n([\s\S]+?)(?:\nWork Address|\nJob Description|\ncompany\b)",
             raw_body, re.IGNORECASE
@@ -188,55 +364,41 @@ def parse_detail_page(page, url):
                 r"[A-ZÁÉÍÓÚ][a-záéíóúäöü]+(?:\s+[A-ZÁÉÍÓÚ][a-záéíóúäöü]+)*",
                 raw_skills
             )
-            extra["skills"] = ", ".join(tokens) if tokens else clean_or_none(raw_skills)
+            result["skills"] = ", ".join(tokens) if tokens else clean_or_none(raw_skills)
 
-        # ── full description ──────────────────────────────────────────────────
+        # full description
         desc_m = re.search(
             r"Job Description\s*\n([\s\S]+?)(?:\nSkills And Expertise|\n+Jobs Posted:|\Z)",
             raw_body, re.IGNORECASE
         )
         if desc_m:
             desc = clean_or_none(desc_m.group(1))
-            extra["full_description"] = desc if desc and len(desc) >= 30 else None
+            result["full_description"] = desc if desc and len(desc) >= 30 else None
 
-        # ── company profile URL ───────────────────────────────────────────────
+        # company profile URL
         company_link = page.query_selector("a[href*='/company/']")
         if company_link:
             href = company_link.get_attribute("href") or ""
             if href:
-                extra["company_profile_url"] = (
+                result["company_profile_url"] = (
                     BASE_URL + href if href.startswith("/") else href
                 )
-            # Also try to get company name from the link text as fallback
-            if not extra["company"]:
-                link_text = clean_or_none(company_link.inner_text())
-                # Only use if it looks like a company name (not "View Company Profile")
-                if link_text and "View" not in link_text and len(link_text) < 80:
-                    extra["company"] = link_text
 
-        # ── company name fallback from body text ──────────────────────────────
-        if not extra["company"]:
-            # Pattern: company name appears just before "Jobs Posted: N"
-            co_m = re.search(r"([^\n]+)\s*\nJobs Posted:\s*\d+", raw_body, re.IGNORECASE)
-            if co_m:
-                extra["company"] = clean_or_none(co_m.group(1))
-
-        # ── company jobs posted ───────────────────────────────────────────────
+        # company jobs posted
         jp_raw = parse_or_none(r"Jobs Posted:\s*(\d+)", raw_body)
-        extra["company_jobs_posted_raw"] = jp_raw
-        extra["company_jobs_posted"]     = to_int_or_none(jp_raw)
+        result["company_jobs_posted_raw"] = jp_raw
+        result["company_jobs_posted"]     = to_int_or_none(jp_raw)
 
-        # ── vacancies to int ─────────────────────────────────────────────────
-        extra["vacancies"] = to_int_or_none(extra["vacancies_raw"])
+        result["vacancies"] = to_int_or_none(result["vacancies_raw"])
 
-        extra["detail_parse_ok"] = True
+        result["detail_parse_ok"] = True
 
     except PWTimeout:
         print(f"  WARNING: Timeout on {url}")
     except Exception as exc:
         print(f"  WARNING: Error on {url}: {exc}")
 
-    return extra
+    return result
 
 
 # ── main scraper ───────────────────────────────────────────────────────────────
@@ -263,9 +425,6 @@ def scrape():
         list_page.wait_for_timeout(2000)
 
         while len(all_jobs) < MAX_JOBS:
-            # ── collect job card links currently visible ──────────────────
-            # The <a> only wraps the title. We walk up to the parent container
-            # to get company, location, job_type, deadline from the card.
             anchors = list_page.query_selector_all("a[href^='/jobs/']")
             job_anchors = [
                 a for a in anchors
@@ -278,67 +437,12 @@ def scrape():
                     print(f"Reached {MAX_JOBS}-job limit.")
                     break
 
-                href       = anchor.get_attribute("href") or ""
-                detail_url = BASE_URL + href if href.startswith("/") else href
+                card = parse_card(anchor)
+                title      = card["title"]
+                detail_url = card["detail_url"]
 
-                # Title from anchor text — most reliable
-                title = clean_or_none(anchor.inner_text())
-
-                # Walk up parent elements to find card container with full text
-                card_text = ""
-                container = anchor
-                for _ in range(5):
-                    parent = container.evaluate_handle("el => el.parentElement")
-                    if not parent:
-                        break
-                    parent_el = parent.as_element()
-                    if not parent_el:
-                        break
-                    text = parent_el.inner_text() or ""
-                    container = parent_el
-                    card_text = text
-                    # Stop once we have job-type or posted-time info
-                    if re.search(r"Onsite|Remote|Hybrid|Posted\s+\d", text, re.IGNORECASE):
-                        break
-
-                # Company: first non-noise line after title
-                company = None
-                for line in [l.strip() for l in card_text.splitlines() if l.strip()]:
-                    if line == title:
-                        continue
-                    if re.search(
-                        r"Posted|Deadline|Onsite|Remote|Hybrid|Full Time|Part Time|"
-                        r"Expert|Senior|Intermediate|Junior|Entry|View Details|ETB|\d{4}",
-                        line, re.IGNORECASE
-                    ):
-                        continue
-                    if len(line) < 3:
-                        continue
-                    company = clean_or_none(line)
-                    break
-
-                # Other card-level fields (used as fallback if detail page fails)
-                location = parse_or_none(
-                    r"([A-Za-z ]+,\s*Ethiopia|Addis Ababa(?:,\s*Ethiopia)?)", card_text
-                )
-                posted_relative = parse_or_none(r"Posted\s+(.+?)(?:\n|$)", card_text)
-                deadline = parse_or_none(
-                    rf"({MONTHS}[a-z]*\.?\s+\d{{1,2}},?\s+\d{{4}})", card_text
-                )
-                job_type = parse_or_none(
-                    r"((?:Onsite|Remote|Hybrid)\s*[-–]\s*(?:Full Time|Part Time|Contract|Freelance))",
-                    card_text
-                )
-                exp_level = parse_or_none(
-                    r"\b(Expert|Senior|Intermediate|Junior|Entry[- ]?Level)\b", card_text
-                )
-
-                # Dedup on title + company + deadline
-                key = (
-                    (title   or "").lower(),
-                    (company or "").lower(),
-                    (deadline or "").lower(),
-                )
+                # Dedup on title + deadline before hitting the detail page
+                key = ((title or "").lower(), (card["deadline"] or "").lower())
                 if key in seen:
                     print(f"  Duplicate skipped: {title or '(no title)'}")
                     continue
@@ -346,19 +450,19 @@ def scrape():
 
                 print(f"  [{len(all_jobs)+1}/{MAX_JOBS}] {(title or '(no title)')[:55]} ...")
 
-                # Detail page — authoritative source for all fields
                 detail = parse_detail_page(detail_page, detail_url)
 
                 job = {
+                    # Detail page is authoritative; card values are fallback
                     "title":                   detail["title"] or title,
-                    "company":                 detail["company"] or company,
-                    "location":                detail["location"] or location,
+                    "company":                 detail["company"] or card["company"],
+                    "location":                detail["location"] or card["location"],
                     "industry":                detail["industry"],
-                    "posted_relative":         posted_relative,
+                    "posted_relative":         card["posted_relative"],
                     "posted_date":             detail["posted_date"],
-                    "deadline":                detail["deadline"] or deadline,
-                    "job_type":                detail["job_type"] or job_type,
-                    "experience_level":        detail["experience_level"] or exp_level,
+                    "deadline":                detail["deadline"] or card["deadline"],
+                    "job_type":                detail["job_type"] or card["job_type"],
+                    "experience_level":        detail["experience_level"] or card["exp_level"],
                     "vacancies":               detail["vacancies"],
                     "education_qualification": detail["education_qualification"],
                     "applicants_needed":       detail["applicants_needed"],
@@ -384,7 +488,7 @@ def scrape():
                 "button:has-text('Load More'), a:has-text('Load More')"
             )
             if not load_more:
-                print("  No more 'Load More' button — all listings exhausted.")
+                print("  No 'Load More' button — all listings exhausted.")
                 break
             print("  Clicking 'Load More' ...")
             load_more.scroll_into_view_if_needed()
@@ -396,19 +500,15 @@ def scrape():
     # ── build DataFrame ────────────────────────────────────────────────────────
     df = pd.DataFrame(all_jobs)
 
-    # Nullable integers
     for col in ("salary", "vacancies", "company_jobs_posted"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
-    # Final dedup
     before = len(df)
     df = df.drop_duplicates(subset=["title", "company", "deadline"])
     dropped = before - len(df)
-    if dropped:
-        print(f"  Final dedup removed {dropped} row(s).")
 
-    # Ensure scraped_at is the last column
+    # scraped_at always last
     cols = [c for c in df.columns if c != "scraped_at"] + ["scraped_at"]
     df = df[cols]
 
@@ -416,13 +516,11 @@ def scrape():
     print("\nNull % per column:")
     null_pct = (df.isna().sum() / len(df) * 100).round(1)
     for col, pct in null_pct.items():
-        flag = "  <-- WARNING high nulls" if pct > 50 else ""
+        flag = "  <-- WARNING" if pct > 50 else ""
         print(f"  {col:<30} {pct:>5}%{flag}")
 
     df.to_parquet(OUTPUT_FILE, index=False, engine="pyarrow")
     print(f"\nSaved {len(df)} jobs to {OUTPUT_FILE}")
-    print(df[["title", "company", "location", "job_type", "deadline", "salary"]].to_string(index=False))
-
 
 if __name__ == "__main__":
     scrape()
